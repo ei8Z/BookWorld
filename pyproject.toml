@@ -1,0 +1,26 @@
+[project]
+name = "book-project"
+version = "0.1.0"
+description = "叙事引擎——将作家、系统执行者、记忆系统拆分为独立模块"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28.1",
+    "pydantic>=2.13.4",
+    "rich>=15.0.0",
+]
+
+[project.scripts]
+book = "book.main:main"
+book-web = "book.web_server:run_server"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/book"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.18",
+]
