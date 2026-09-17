@@ -1,7 +1,9 @@
 """数据库 Schema——创建所有表结构。"""
 
 
-SCHEMA_SQL = """
+# ─── P0 基础表 ─────────────────────────────────────────────────────────────
+# 与 P1 结构分开：migrate() 需要单独确保基础表存在，P1 表由 P1_SCHEMA_SQL 负责。
+BASE_SCHEMA_SQL = """
 -- 玩家信息（单行表）
 CREATE TABLE IF NOT EXISTS player (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -39,7 +41,10 @@ CREATE TABLE IF NOT EXISTS story_state (
     current_date TEXT NOT NULL DEFAULT '2026年06月22日 星期一',
     current_time TEXT NOT NULL DEFAULT '上午 08:00',
     current_scene TEXT DEFAULT '',
-    chapter INTEGER DEFAULT 1
+    chapter INTEGER DEFAULT 1,
+    -- P1：卷号（对应 volumes.idx）与当前 POV 视角角色
+    current_volume INTEGER,
+    current_pov TEXT
 );
 
 -- 临时记忆
@@ -154,6 +159,76 @@ CREATE INDEX IF NOT EXISTS idx_perm_memories_seq ON perm_memories(seq);
 CREATE INDEX IF NOT EXISTS idx_npcs_name ON npcs(name);
 CREATE INDEX IF NOT EXISTS idx_items_category ON items(category);
 """
+
+
+# ─── P1：卷 / 章 / 场景 / 伏笔 / 实体别名 ───────────────────────────────────
+# migrate() 被单独调用时也要把这几张表建出来，所以独立成一个常量。
+P1_SCHEMA_SQL = """
+-- 卷（idx 是卷号；表内 id 只是主键，对外一律用 idx）
+CREATE TABLE IF NOT EXISTS volumes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    idx INTEGER NOT NULL,
+    title TEXT DEFAULT '',
+    synopsis TEXT DEFAULT '',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 章：volume_idx 指向 volumes.idx，idx 是章号
+CREATE TABLE IF NOT EXISTS chapters (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    volume_idx INTEGER NOT NULL,
+    idx INTEGER NOT NULL,
+    title TEXT DEFAULT '',
+    pov TEXT DEFAULT '',
+    goal TEXT DEFAULT '',
+    status TEXT DEFAULT '草稿',
+    word_count INTEGER DEFAULT 0,
+    file_path TEXT DEFAULT '',
+    summary TEXT DEFAULT '',
+    UNIQUE(volume_idx, idx)
+);
+
+-- 场景：chapter_idx 指向 chapters.idx
+CREATE TABLE IF NOT EXISTS scenes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chapter_idx INTEGER NOT NULL,
+    idx INTEGER NOT NULL,
+    location TEXT DEFAULT '',
+    pov TEXT DEFAULT '',
+    summary TEXT DEFAULT '',
+    UNIQUE(chapter_idx, idx)
+);
+
+-- 伏笔
+CREATE TABLE IF NOT EXISTS foreshadows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    detail TEXT DEFAULT '',
+    planted_volume INTEGER,
+    planted_chapter INTEGER,
+    status TEXT DEFAULT '未收',
+    planned_recovery TEXT DEFAULT '',
+    recovered_chapter INTEGER
+);
+
+-- 实体别名：把"别名 → 实体"登记下来，供提及驱动注入做精确匹配
+CREATE TABLE IF NOT EXISTS entity_aliases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    alias TEXT NOT NULL,
+    UNIQUE(entity_type, entity_id, alias)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chapters_volume ON chapters(volume_idx, idx);
+CREATE INDEX IF NOT EXISTS idx_scenes_chapter ON scenes(chapter_idx, idx);
+CREATE INDEX IF NOT EXISTS idx_foreshadows_status ON foreshadows(status);
+CREATE INDEX IF NOT EXISTS idx_aliases_alias ON entity_aliases(alias);
+"""
+
+
+# 完整结构 = P0 基础表 + P1 结构（init_db 用这个）
+SCHEMA_SQL = BASE_SCHEMA_SQL + P1_SCHEMA_SQL
 
 INIT_SQL = """
 -- 初始化默认数据

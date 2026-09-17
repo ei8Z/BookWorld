@@ -2,27 +2,77 @@
 
 from __future__ import annotations
 import json
+import os
 import sys
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
+from . import books
+from .cli import CliError
+from .executor import consistency
 from .main import BookEngine
 
 
-# ─── 全局引擎实例（模块级别，整个服务器生命周期共享） ────────────────────────
+# ─── 引擎实例（按书 + 按线程隔离） ──────────────────────────────────────────
+#
+# 关键约束：sqlite3.Connection 默认 check_same_thread=True，**不能跨线程使用**。
+# ThreadingHTTPServer 每个请求一个线程，所以引擎（进而连接）必须按线程隔离，
+# 否则并发请求会成片报 "SQLite objects created in a thread can only be used in
+# that same thread"。这里用 thread-local 缓存：每个线程各自持有若干书的引擎。
 
-_engine: BookEngine | None = None
+_local = threading.local()
+_engine_lock = threading.Lock()
+_all_engines: list[BookEngine] = []
+
+# 当绑定到非回环地址时必须提供的令牌（P3-3 安全要求）
+API_TOKEN_ENV = "BOOK_API_TOKEN"
+
+# 允许免令牌访问的地址（本机）。非回环绑定才强制令牌。
+_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+# 本机请求可以免令牌：内嵌页面跑在浏览器里，不方便注入 Authorization 头。
+# 安全模型是"把服务暴露到局域网才需要令牌"，本机访问本来就是可信的。
+_ALLOW_LOCAL_WITHOUT_TOKEN = True
+
+# 请求体上限：防止 Content-Length 巨值把工作线程卡住（DoS）
+MAX_BODY_BYTES = 32 * 1024 * 1024
+
+# /api/ingest 允许读取的文件后缀：file_path 否则等于一个任意文件读取原语
+_INGEST_ALLOWED_SUFFIXES = {".md", ".txt", ".markdown", ".text"}
 
 
-def get_engine() -> BookEngine:
-    global _engine
-    if _engine is None:
-        _engine = BookEngine()
-        # 从数据库加载持久化的 API Key（优先环境变量）
-        if not _engine.llm.api_key:
-            stored = _engine.repo.get_setting("api_key")
+def get_engine(book: str | None = None) -> BookEngine:
+    """取当前线程专属的引擎（同一线程内按书缓存复用）。"""
+    key = books.normalize_slug(book or books.DEFAULT_SLUG)
+    cache = getattr(_local, "engines", None)
+    if cache is None:
+        cache = {}
+        _local.engines = cache
+    engine = cache.get(key)
+    if engine is None:
+        engine = BookEngine(db_path=books.resolve(key))
+        if not engine.llm.api_key:
+            stored = engine.repo.get_setting("api_key")
             if stored:
-                _engine.set_api_key(stored)
-    return _engine
+                engine.set_api_key(stored)
+        cache[key] = engine
+        with _engine_lock:
+            _all_engines.append(engine)
+    return engine
+
+
+def close_engines() -> None:
+    """关闭已创建的全部引擎（测试与退出时用）。"""
+    with _engine_lock:
+        engines, _all_engines[:] = list(_all_engines), []
+    for engine in engines:
+        try:
+            engine.close()
+        except Exception:  # noqa: BLE001
+            pass
+    _local.engines = {}
 
 
 # ─── HTML 页面 ────────────────────────────────────────────────────────────────
@@ -606,19 +656,103 @@ document.getElementById('settingsModal').addEventListener('click', function(e) {
 # ─── HTTP 请求处理器 ──────────────────────────────────────────────────────────
 
 class BookHandler(BaseHTTPRequestHandler):
+    # 由 run_server 注入：绑定非回环地址时要求的令牌（None 表示不要求）
+    required_token: str | None = None
 
     def log_message(self, format, *args):
         """重定向日志到 stderr。"""
         print(f"[Web] {args[0]}", file=sys.stderr)
 
+    # ─── 请求解析 ─────────────────────────────────────────────────────────
+
+    @property
+    def _parsed(self):
+        return urlparse(self.path)
+
+    @property
+    def route(self) -> str:
+        return self._parsed.path
+
+    @property
+    def query(self) -> dict:
+        return {k: v[0] for k, v in parse_qs(self._parsed.query).items()}
+
+    def _book(self) -> str | None:
+        """从 ?book= / X-Book 头取书标识。"""
+        book = self.query.get("book") or self.headers.get("X-Book")
+        return book.strip() if book else None
+
+    def _is_local(self) -> bool:
+        """请求是否来自本机。"""
+        host = (self.client_address[0] if self.client_address else "") or ""
+        return host in _LOOPBACK
+
+    def _authorized(self) -> bool:
+        if not self.required_token:
+            return True
+        # 本机（浏览器 UI）免令牌：令牌是为了防止局域网/公网裸奔
+        if _ALLOW_LOCAL_WITHOUT_TOKEN and self._is_local():
+            return True
+        header = self.headers.get("Authorization", "") or ""
+        parts = header.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            if parts[1].strip() == self.required_token:
+                return True
+        token_header = (self.headers.get("X-API-Token", "") or "").strip()
+        return token_header == self.required_token
+
     def _send_json(self, data: dict, status: int = 200):
-        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_error_json(self, message: str, kind: str = "internal", status: int = 500):
+        """错误体与 CLI 的 JSON 错误保持同形：{"error","kind"}。"""
+        self._send_json({"error": message, "kind": kind}, status)
+
+    # ─── 参数校验（与 CLI 的口径保持一致：非法输入 → 400 usage） ──────────
+
+    def _int_param(self, value, name: str, default=None, minimum=None, maximum=None):
+        """把 HTTP 参数强转成 int；非法时抛 CliError（由调用方转成 400）。
+
+        不接受 bool（JSON true 会被 int() 变成 1，属于静默错值）。
+        """
+        if value is None or value == "":
+            return default
+        if isinstance(value, bool):
+            raise CliError(f"{name} 必须是整数", kind="usage", code=2)
+        try:
+            num = int(value)
+        except (TypeError, ValueError):
+            raise CliError(f"{name} 必须是整数，收到 {value!r}", kind="usage", code=2)
+        if minimum is not None and num < minimum:
+            raise CliError(f"{name} 不能小于 {minimum}，收到 {num}", kind="usage", code=2)
+        if maximum is not None and num > maximum:
+            raise CliError(f"{name} 不能大于 {maximum}，收到 {num}", kind="usage", code=2)
+        return num
+
+    def _float_param(self, value, name: str, default=None):
+        if value is None or value == "":
+            return default
+        if isinstance(value, bool):
+            raise CliError(f"{name} 必须是数字", kind="usage", code=2)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            raise CliError(f"{name} 必须是数字，收到 {value!r}", kind="usage", code=2)
+
+    def _str_param(self, value, name: str, default=None):
+        """必须是字符串（或 None）。数字/布尔一律拒绝，避免静默强转。"""
+        if value is None:
+            return default
+        if not isinstance(value, str):
+            raise CliError(f"{name} 必须是字符串，收到 {type(value).__name__}",
+                           kind="usage", code=2)
+        return value
 
     def _send_html(self, html: str, status: int = 200):
         body = html.encode("utf-8")
@@ -630,46 +764,153 @@ class BookHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/" or self.path == "/index.html":
+        route = self.route
+
+        if route in ("/", "/index.html"):
             self._send_html(HTML_PAGE)
-        elif self.path == "/api/state":
-            try:
-                engine = get_engine()
-                output = engine.show_state()
-                self._send_json({"output": output})
-            except Exception as e:
-                self._send_json({"error": str(e)}, 500)
-        elif self.path == "/api/settings":
-            try:
-                engine = get_engine()
-                settings = engine.repo.get_all_settings()
-                self._send_json({"settings": settings})
-            except Exception as e:
-                self._send_json({"error": str(e)}, 500)
-        elif self.path == "/api/key-status":
-            engine = get_engine()
-            # 检查内存和数据库中的 key
-            stored_key = engine.repo.get_setting("api_key")
-            self._send_json({"has_key": bool(engine.llm.api_key or stored_key)})
-        elif self.path == "/api/history":
-            engine = get_engine()
-            rounds = engine.repo.get_session_rounds(limit=0)  # 0 = 全部
-            self._send_json({"rounds": rounds})
-        else:
-            self.send_response(404)
-            self.end_headers()
+            return
+
+        if not self._authorized():
+            self._send_error_json("缺少或错误的访问令牌", "unauthorized", 401)
+            return
+
+        try:
+            if route == "/api/state":
+                engine = get_engine(self._book())
+                self._send_json({"output": engine.show_state()})
+            elif route == "/api/settings":
+                engine = get_engine(self._book())
+                self._send_json({"settings": engine.repo.get_all_settings()})
+            elif route == "/api/key-status":
+                engine = get_engine(self._book())
+                stored_key = engine.repo.get_setting("api_key")
+                self._send_json({"has_key": bool(engine.llm.api_key or stored_key)})
+            elif route == "/api/history":
+                engine = get_engine(self._book())
+                self._send_json({"rounds": engine.repo.get_session_rounds(limit=0)})
+            elif route == "/api/books":
+                self._send_json({"books": books.list_books()})
+            elif route == "/api/search":
+                self._handle_search()
+            elif route == "/api/check":
+                self._handle_check()
+            else:
+                self._send_error_json("未知路径", "not_found", 404)
+        except books.BookError as e:
+            self._send_error_json(str(e), "usage", 400)
+        except Exception as e:  # noqa: BLE001
+            self._send_error_json(f"{type(e).__name__}: {e}", "internal", 500)
+
+    # ─── P3 新端点（字段与 CLI 的 --json 契约同名） ────────────────────────
+
+    _TRUTHY = {"1", "true", "yes", "on"}
+
+    def _handle_search(self):
+        q = self.query
+        query = (q.get("q") or "").strip()
+        if not query:
+            self._send_error_json("缺少查询参数 q", "usage", 400)
+            return
+        from .db import search as search_mod
+
+        try:
+            k = self._int_param(q.get("k"), "k", default=5, minimum=0)
+            volume = self._int_param(q.get("volume"), "volume")
+            min_score = self._float_param(q.get("min_score"), "min_score")
+            source = self._str_param(q.get("source"), "source")
+        except CliError as exc:
+            self._send_error_json(str(exc), exc.kind, 400)
+            return
+
+        semantic = (q.get("semantic") or "").strip().lower() in self._TRUTHY
+        engine = get_engine(self._book())
+        hits = search_mod.search(
+            engine.repo.conn, query, k=k,
+            source=source or None,
+            volume=volume,
+            semantic=semantic,
+            min_score=min_score or 0.0,
+        )
+        self._send_json({
+            "query": query,
+            "mode": "semantic" if semantic else "fts",
+            "hits": [h.to_dict() for h in hits],
+        })
+
+    def _handle_check(self):
+        q = self.query
+        from .cli import _parse_range  # 复用 CLI 的区间校验（错误信息与退出码语义一致）
+
+        try:
+            # stale 不能为负（与 CLI 一致：CLI 会直接拒绝）
+            stale = self._int_param(
+                q.get("foreshadow_stale"), "foreshadow_stale", default=30, minimum=0
+            )
+            start, end = _parse_range(q.get("range"))
+        except CliError as exc:
+            self._send_error_json(str(exc), exc.kind, 400)
+            return
+        engine = get_engine(self._book())
+        issues = consistency.run_checks(
+            engine.repo, range_start=start, range_end=end, stale_after=stale,
+        )
+        self._send_json({
+            "range": [start, end],
+            "issues": [i.to_dict() for i in issues],
+        })
 
     def do_POST(self):
-        content_len = int(self.headers.get("Content-Length", 0))
+        if not self._authorized():
+            self._send_error_json("缺少或错误的访问令牌", "unauthorized", 401)
+            return
+
+        raw_len = self.headers.get("Content-Length", "0") or "0"
+        try:
+            content_len = int(raw_len)
+        except ValueError:
+            self._send_error_json("Content-Length 非法", "usage", 400)
+            return
+        if content_len < 0 or content_len > MAX_BODY_BYTES:
+            self._send_error_json(
+                f"请求体过大或非法（上限 {MAX_BODY_BYTES} 字节）", "usage", 400
+            )
+            return
         body_raw = self.rfile.read(content_len) if content_len > 0 else b"{}"
 
         try:
             body = json.loads(body_raw)
         except json.JSONDecodeError:
-            self._send_json({"error": "无效的 JSON"}, 400)
+            self._send_error_json("无效的 JSON", "usage", 400)
             return
 
-        if self.path == "/api/chat":
+        if not isinstance(body, dict):
+            self._send_error_json("请求体必须是 JSON 对象", "usage", 400)
+            return
+
+        # 请求体里的 book 优先，其次查询串/请求头。
+        # 类型必须先校验：body["book"] 是数字时 .strip() 会抛 AttributeError，
+        # 直接掐断连接（客户端只看到 RemoteDisconnected，违反 §5 错误契约）。
+        raw_book = body.get("book")
+        if raw_book is not None and not isinstance(raw_book, str):
+            self._send_error_json("book 必须是字符串", "usage", 400)
+            return
+        book = (raw_book or "").strip() or self._book() or None
+
+        try:
+            if self.route == "/api/context":
+                self._handle_context(body, book)
+                return
+            if self.route == "/api/ingest":
+                self._handle_ingest(body, book)
+                return
+        except books.BookError as e:
+            self._send_error_json(str(e), "usage", 400)
+            return
+        except Exception as e:  # noqa: BLE001
+            self._send_error_json(f"{type(e).__name__}: {e}", "internal", 500)
+            return
+
+        if self.route == "/api/chat":
             user_input = body.get("input", "").strip()
             if not user_input:
                 self._send_json({"error": "输入不能为空"}, 400)
@@ -677,11 +918,14 @@ class BookHandler(BaseHTTPRequestHandler):
 
             headers_sent = False
             try:
-                engine = get_engine()
+                engine = get_engine(book)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "keep-alive")
+                # 必须让连接在响应结束后关闭：发 "keep-alive" 会把 close_connection
+                # 置回 False，线程会永远卡在 readline 上（每连接泄漏一个线程，
+                # 客户端按 EOF 判断结束的写法也会挂死）。SSE 的结束标志是 done 事件。
+                self.close_connection = True
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 headers_sent = True
@@ -702,31 +946,35 @@ class BookHandler(BaseHTTPRequestHandler):
                 else:
                     self._send_json({"error": f"{type(e).__name__}: {e}"}, 500)
 
-        elif self.path == "/api/reset":
-            # 关闭旧引擎，删除数据库，重新初始化（保留 API Key）
+        elif self.route == "/api/reset":
+            # 关闭当前线程这本书的引擎，删除数据库，重新初始化（保留 API Key）
             try:
-                global _engine
+                key = books.normalize_slug(book or books.DEFAULT_SLUG)
+                cache = getattr(_local, "engines", {}) or {}
+                old = cache.pop(key, None)
                 saved_key = ""
-                if _engine:
-                    saved_key = _engine.repo.get_setting("api_key")
-                    _engine.close()
-                    _engine = None
-                from .config import config
-                if config.db_path.exists():
-                    config.db_path.unlink()
-                _engine = BookEngine()
+                if old is not None:
+                    saved_key = old.repo.get_setting("api_key")
+                    old.close()
+                    with _engine_lock:
+                        if old in _all_engines:
+                            _all_engines.remove(old)
+                target = books.resolve(key)
+                if target.exists():
+                    target.unlink()
+                engine = get_engine(key)
                 if saved_key:
-                    _engine.set_api_key(saved_key)
-                    _engine.repo.set_setting("api_key", saved_key)
+                    engine.set_api_key(saved_key)
+                    engine.repo.set_setting("api_key", saved_key)
                 self._send_json({"ok": True})
             except Exception as e:
-                self._send_json({"error": str(e)}, 500)
+                self._send_error_json(str(e), "internal", 500)
 
-        elif self.path == "/api/settings":
+        elif self.route == "/api/settings":
             if body.get("action") == "save":
                 # 保存设定
                 try:
-                    engine = get_engine()
+                    engine = get_engine(book)
                     settings_data = body.get("settings", {})
                     if settings_data:
                         engine.repo.set_settings_batch(settings_data)
@@ -737,43 +985,155 @@ class BookHandler(BaseHTTPRequestHandler):
             else:
                 # 读取设定
                 try:
-                    engine = get_engine()
+                    engine = get_engine(book)
                     settings = engine.repo.get_all_settings()
                     self._send_json({"settings": settings})
                 except Exception as e:
                     self._send_json({"error": str(e)}, 500)
 
-        elif self.path == "/api/set-key":
+        elif self.route == "/api/set-key":
             api_key = body.get("key", "").strip()
             if not api_key:
-                self._send_json({"error": "Key 不能为空"}, 400)
+                self._send_error_json("Key 不能为空", "usage", 400)
                 return
             try:
-                engine = get_engine()
+                engine = get_engine(book)
                 engine.set_api_key(api_key)
                 engine.repo.set_setting("api_key", api_key)
                 self._send_json({"ok": True})
             except Exception as e:
-                self._send_json({"error": str(e)}, 500)
+                self._send_error_json(str(e), "internal", 500)
 
         else:
-            self.send_response(404)
-            self.end_headers()
+            self._send_error_json("未知路径", "not_found", 404)
+
+    # ─── P3 新端点实现 ────────────────────────────────────────────────────
+
+    def _handle_context(self, body: dict, book: str | None):
+        from .writer.context_builder import build_context
+
+        try:
+            pov = self._str_param(body.get("pov"), "pov", default="") or ""
+            scene = self._str_param(body.get("scene"), "scene", default="") or ""
+            extra_text = self._str_param(body.get("extra_text"), "extra_text", default="") or ""
+            budget = self._int_param(body.get("budget_chars"), "budget_chars", default=6000)
+            chapter = self._int_param(body.get("chapter"), "chapter")
+        except CliError as exc:
+            self._send_error_json(str(exc), exc.kind, 400)
+            return
+
+        if not pov.strip():
+            self._send_error_json("pov 不能为空", "usage", 400)
+            return
+        # 负预算会让 build_context 直接丢光所有分区，属于误用
+        if budget is None or budget < 0:
+            self._send_error_json("budget_chars 不能为负数", "usage", 400)
+            return
+
+        engine = get_engine(book)
+        pack = build_context(
+            engine.repo,
+            pov=pov,
+            scene=scene,
+            chapter=chapter,
+            budget_chars=budget,
+            extra_text=extra_text,
+        )
+        self._send_json(pack.to_dict())
+
+    def _handle_ingest(self, body: dict, book: str | None):
+        from .cli import CliError, cmd_ingest, build_parser
+
+        file_path = body.get("file_path")
+        text = body.get("text")
+        if file_path is not None and not isinstance(file_path, str):
+            self._send_error_json("file_path 必须是字符串", "usage", 400)
+            return
+        if text is not None and not isinstance(text, str):
+            self._send_error_json("text 必须是字符串", "usage", 400)
+            return
+        if not file_path and text is None:
+            self._send_error_json("必须提供 file_path 或 text", "usage", 400)
+            return
+
+        # 远程可调用的 file_path 等于"任意服务端文件读取原语"：
+        # 读任意文件 → 入正文库 → 再 /api/search 取回内容。
+        # 这里限制后缀；如果你确实要导入其它格式，请走本地 CLI（bookctl ingest）。
+        if file_path:
+            suffix = Path(file_path).suffix.lower()
+            if suffix not in _INGEST_ALLOWED_SUFFIXES:
+                self._send_error_json(
+                    f"file_path 只允许 {'/'.join(sorted(_INGEST_ALLOWED_SUFFIXES))} "
+                    f"后缀（收到 {suffix or '无后缀'}）；其它格式请用本地 CLI 导入",
+                    "usage", 400,
+                )
+                return
+
+        argv = ["--db", str(books.resolve(book)), "ingest", "--json"]
+        if book:
+            argv = ["--book", book, "ingest", "--json"]
+        if body.get("file_path"):
+            argv += ["--file", str(body["file_path"])]
+        else:
+            argv += ["--text", str(body["text"])]
+        if body.get("volume") is not None:
+            argv += ["--volume", str(body["volume"])]
+        if body.get("chapter") is not None:
+            argv += ["--chapter", str(body["chapter"])]
+        if body.get("pov"):
+            argv += ["--pov", str(body["pov"])]
+        if body.get("round") is not None:
+            argv += ["--round", str(body["round"])]
+        if body.get("no_extract"):
+            argv += ["--no-extract"]
+
+        args = build_parser().parse_args(argv)
+        try:
+            payload = cmd_ingest(args)
+        except CliError as exc:
+            self._send_error_json(str(exc), exc.kind,
+                                  400 if exc.kind == "usage" else 500)
+            return
+        self._send_json(payload)
 
     def do_OPTIONS(self):
         """处理 CORS 预检请求。"""
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type, Authorization, X-API-Token, X-Book",
+        )
+        self.send_header("Access-Control-Max-Age", "600")
         self.end_headers()
 
 
 # ─── 服务器启动 ───────────────────────────────────────────────────────────────
 
-def run_server(host: str = "127.0.0.1", port: int = 8080, open_browser: bool = True):
-    """启动 Web 服务器。"""
+def run_server(
+    host: str = "127.0.0.1",
+    port: int = 8080,
+    open_browser: bool = True,
+    book: str | None = None,
+):
+    """启动 Web 服务器。
+
+    - 用 ThreadingHTTPServer：SSE 期间不再阻塞其它请求（P3-1）
+    - 绑定非回环地址时必须设置 BOOK_API_TOKEN，否则拒绝启动（P3-3）
+    """
     from .config import config
+
+    # 安全闸门：暴露到 127.0.0.1 之外必须带令牌
+    token = os.environ.get(API_TOKEN_ENV, "").strip()
+    if host not in _LOOPBACK and not token:
+        print(
+            f"错误：绑定到 {host}（非回环地址）时必须设置环境变量 {API_TOKEN_ENV}，"
+            "否则任何人都能读写你的故事数据。已拒绝启动。",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    BookHandler.required_token = token or None
 
     # 检查 API Key 是否已配置（环境变量 + 数据库）
     has_key = bool(config.llm_api_key)
@@ -796,7 +1156,8 @@ def run_server(host: str = "127.0.0.1", port: int = 8080, open_browser: bool = T
 ║  或设置环境变量 DEEPSEEK_API_KEY              ║
 ║                                              ║"""
 
-    server = HTTPServer((host, port), BookHandler)
+    server = ThreadingHTTPServer((host, port), BookHandler)
+    server.daemon_threads = True
     url = f"http://{host}:{port}"
 
     print(f"""
@@ -817,17 +1178,23 @@ def run_server(host: str = "127.0.0.1", port: int = 8080, open_browser: bool = T
     except KeyboardInterrupt:
         print("\n服务器已停止。")
         server.shutdown()
-        global _engine
-        if _engine:
-            _engine.close()
-            _engine = None
+        close_engines()
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> int:
+    """入口（book-web 脚本与 python -m 共用，会真的解析参数）。"""
     import argparse
+
     parser = argparse.ArgumentParser(description="Book 叙事引擎 Web 服务器")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址 (默认: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8080, help="监听端口 (默认: 8080)")
     parser.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
-    args = parser.parse_args()
-    run_server(host=args.host, port=args.port, open_browser=not args.no_browser)
+    parser.add_argument("--book", default=None, help="默认书标识（多书隔离）")
+    args = parser.parse_args(argv)
+    run_server(host=args.host, port=args.port,
+               open_browser=not args.no_browser, book=args.book)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

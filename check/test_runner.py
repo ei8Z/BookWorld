@@ -59,12 +59,12 @@ def test_config():
     from book.config import Config
 
     c = Config()
-    check("默认 db_path 指向 data/book.db", c.db_path == Path("data/book.db"))
+    check("默认 db_path 指向 data/book.db", Path(c.db_path).name == "book.db" and Path(c.db_path).parent.name == "data")
     check("默认 LLM base 为 DeepSeek API", "deepseek.com" in c.llm_api_base)
-    check("默认 model 为 deepseek-chat", c.llm_model == "deepseek-chat")
+    check("默认 model 为 deepseek-flash", c.llm_model == "deepseek-flash")
     check("临时记忆上限 = 10", c.temp_memory_max == 10)
     check("永久记忆压缩阈值 = 6", c.perm_memory_compress_at == 6)
-    check("output_dir 默认指向 output", str(c.output_dir) == "output")
+    check("output_dir 默认指向 output", Path(c.output_dir).name == "output")
 
     # 测试环境变量
     os.environ["DEEPSEEK_API_KEY"] = "test-key-123"

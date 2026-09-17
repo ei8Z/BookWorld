@@ -22,7 +22,10 @@ from ..models import (
 # ─── SQL 列名白名单（防止通过 kwargs 注入） ───────────────────────────────
 
 _VALID_COLUMNS = {
-    "story_state": {"current_date", "current_time", "current_scene", "chapter"},
+    "story_state": {
+        "current_date", "current_time", "current_scene", "chapter",
+        "current_volume", "current_pov",
+    },
     "player": {
         "name", "age", "height_cm", "weight_kg", "title", "currency",
         "level", "current_exp", "max_exp", "hp", "max_hp", "atk",
@@ -56,6 +59,8 @@ class Repository:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
+        # 并发写入（多客户端/多进程）时先等锁而不是立刻抛 database is locked
+        self.conn.execute("PRAGMA busy_timeout=5000")
         self._in_transaction = False
 
     def _commit(self):
@@ -67,12 +72,20 @@ class Repository:
         """返回事务上下文管理器，用于包裹多步写操作。"""
         return _Transaction(self)
 
-    def init_db(self):
-        """首次运行时初始化表结构与默认数据。"""
+    def init_db(self, *, migrate: bool = True):
+        """首次运行时初始化表结构与默认数据，并执行幂等迁移。
+
+        migrate=False 用于"只读命令不该改库结构"的场景（P3 的 --no-migrate）：
+        只建缺失的表，不跑列级迁移。
+        """
         from .schema import SCHEMA_SQL, INIT_SQL
         self.conn.executescript(SCHEMA_SQL)
         self.conn.executescript(INIT_SQL)
         self._commit()
+        if migrate:
+            # 迁移必须在建表之后：兼容已存在的旧库（幂等，可重复执行）
+            from .migrations import migrate
+            migrate(self.conn)
 
     def close(self):
         self.conn.close()
@@ -81,11 +94,15 @@ class Repository:
 
     def get_story_state(self) -> StoryState:
         row = self.conn.execute("SELECT * FROM story_state WHERE id=1").fetchone()
+        keys = row.keys()
         return StoryState(
             current_date=row["current_date"],
             current_time=row["current_time"],
             current_scene=row["current_scene"],
             chapter=row["chapter"],
+            # P1 列：未迁移的旧库没有这两列，取 None
+            current_volume=row["current_volume"] if "current_volume" in keys else None,
+            current_pov=row["current_pov"] if "current_pov" in keys else None,
         )
 
     def update_story_state(self, **kwargs):
@@ -375,6 +392,194 @@ class Repository:
         )
         self._commit()
 
+    # ─── P1：卷 / 章 / 场景 ───────────────────────────────────────────────
+
+    def upsert_volume(self, idx: int, title: str = "", synopsis: str = "") -> int:
+        """按卷号写入或更新卷，返回行 id。"""
+        existing = self.conn.execute(
+            "SELECT id FROM volumes WHERE idx=?", (idx,)
+        ).fetchone()
+        if existing:
+            self.conn.execute(
+                "UPDATE volumes SET title=?, synopsis=? WHERE id=?",
+                (title, synopsis, existing["id"]),
+            )
+            self._commit()
+            return int(existing["id"])
+        cur = self.conn.execute(
+            "INSERT INTO volumes (idx, title, synopsis) VALUES (?,?,?)",
+            (idx, title, synopsis),
+        )
+        self._commit()
+        return int(cur.lastrowid)
+
+    def get_volume(self, idx: int) -> Optional[dict]:
+        row = self.conn.execute("SELECT * FROM volumes WHERE idx=?", (idx,)).fetchone()
+        return dict(row) if row else None
+
+    def get_all_volumes(self) -> list[dict]:
+        rows = self.conn.execute("SELECT * FROM volumes ORDER BY idx").fetchall()
+        return [dict(r) for r in rows]
+
+    def upsert_chapter(
+        self,
+        idx: int,
+        volume_idx: int = 1,
+        title: str = "",
+        pov: str = "",
+        goal: str = "",
+        status: str = "草稿",
+        word_count: int = 0,
+        file_path: str = "",
+        summary: str = "",
+    ) -> int:
+        """按 (卷号, 章号) 写入或更新章，返回行 id。"""
+        existing = self.conn.execute(
+            "SELECT id FROM chapters WHERE volume_idx=? AND idx=?", (volume_idx, idx)
+        ).fetchone()
+        if existing:
+            self.conn.execute(
+                """UPDATE chapters
+                   SET title=?, pov=?, goal=?, status=?, word_count=?, file_path=?, summary=?
+                   WHERE id=?""",
+                (title, pov, goal, status, word_count, file_path, summary, existing["id"]),
+            )
+            self._commit()
+            return int(existing["id"])
+        cur = self.conn.execute(
+            """INSERT INTO chapters
+               (volume_idx, idx, title, pov, goal, status, word_count, file_path, summary)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (volume_idx, idx, title, pov, goal, status, word_count, file_path, summary),
+        )
+        self._commit()
+        return int(cur.lastrowid)
+
+    def get_chapter(self, idx: int, volume_idx: int | None = None) -> Optional[dict]:
+        if volume_idx is None:
+            row = self.conn.execute(
+                "SELECT * FROM chapters WHERE idx=? ORDER BY volume_idx LIMIT 1", (idx,)
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT * FROM chapters WHERE volume_idx=? AND idx=?",
+                (volume_idx, idx),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_chapters(self, volume_idx: int | None = None) -> list[dict]:
+        if volume_idx is None:
+            rows = self.conn.execute(
+                "SELECT * FROM chapters ORDER BY volume_idx, idx"
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM chapters WHERE volume_idx=? ORDER BY idx", (volume_idx,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def upsert_scene(
+        self,
+        chapter_idx: int,
+        idx: int,
+        location: str = "",
+        pov: str = "",
+        summary: str = "",
+    ) -> int:
+        """按 (章号, 场景号) 写入或更新场景，返回行 id。"""
+        existing = self.conn.execute(
+            "SELECT id FROM scenes WHERE chapter_idx=? AND idx=?", (chapter_idx, idx)
+        ).fetchone()
+        if existing:
+            self.conn.execute(
+                "UPDATE scenes SET location=?, pov=?, summary=? WHERE id=?",
+                (location, pov, summary, existing["id"]),
+            )
+            self._commit()
+            return int(existing["id"])
+        cur = self.conn.execute(
+            "INSERT INTO scenes (chapter_idx, idx, location, pov, summary) VALUES (?,?,?,?,?)",
+            (chapter_idx, idx, location, pov, summary),
+        )
+        self._commit()
+        return int(cur.lastrowid)
+
+    def list_scenes(self, chapter_idx: int | None = None) -> list[dict]:
+        if chapter_idx is None:
+            rows = self.conn.execute(
+                "SELECT * FROM scenes ORDER BY chapter_idx, idx"
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM scenes WHERE chapter_idx=? ORDER BY idx", (chapter_idx,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ─── P1：伏笔 ─────────────────────────────────────────────────────────
+
+    def add_foreshadow(
+        self,
+        name: str,
+        detail: str = "",
+        planted_volume: int | None = None,
+        planted_chapter: int | None = None,
+        planned_recovery: str = "",
+    ) -> int:
+        cur = self.conn.execute(
+            """INSERT INTO foreshadows
+               (name, detail, planted_volume, planted_chapter, status, planned_recovery)
+               VALUES (?,?,?,?,?,?)""",
+            (name, detail, planted_volume, planted_chapter, "未收", planned_recovery),
+        )
+        self._commit()
+        return int(cur.lastrowid)
+
+    def list_foreshadows(self, status: str | None = None) -> list[dict]:
+        if status is None:
+            rows = self.conn.execute("SELECT * FROM foreshadows ORDER BY id").fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM foreshadows WHERE status=? ORDER BY id", (status,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def close_foreshadow(self, name: str, recovered_chapter: int | None = None) -> int:
+        """按名字收线；返回受影响行数。"""
+        cur = self.conn.execute(
+            "UPDATE foreshadows SET status='已收', recovered_chapter=? WHERE name=? AND status='未收'",
+            (recovered_chapter, name),
+        )
+        self._commit()
+        return cur.rowcount
+
+    # ─── P1：实体别名 ─────────────────────────────────────────────────────
+
+    def add_alias(self, entity_type: str, entity_id: str, alias: str) -> None:
+        self.conn.execute(
+            "INSERT OR IGNORE INTO entity_aliases (entity_type, entity_id, alias) VALUES (?,?,?)",
+            (entity_type, str(entity_id), alias),
+        )
+        self._commit()
+
+    def get_aliases(self) -> dict[str, list[str]]:
+        """返回 {实体名或实体标识: [别名…]}，供提及匹配使用。
+
+        这里按 entity_id 归组；调用方再用实体名字兜底匹配。
+        """
+        rows = self.conn.execute(
+            "SELECT entity_type, entity_id, alias FROM entity_aliases ORDER BY id"
+        ).fetchall()
+        out: dict[str, list[str]] = {}
+        for r in rows:
+            out.setdefault(str(r["entity_id"]), []).append(r["alias"])
+        return out
+
+    def list_aliases(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM entity_aliases ORDER BY entity_type, entity_id, alias"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     # ─── 会话历史 ─────────────────────────────────────────────────────────
 
     def get_session_rounds(self, limit: int = 5) -> list[dict]:
@@ -389,12 +594,58 @@ class Repository:
             rows = list(reversed(rows))
         return [dict(r) for r in rows]
 
-    def add_session(self, round_number: int, user_input: str, narrative: str, state: dict):
-        self.conn.execute(
-            "INSERT INTO session_history (round_number,user_input,narrative,story_state_json) VALUES (?,?,?,?)",
-            (round_number, user_input, narrative, json.dumps(state, ensure_ascii=False))
+    def add_session(self, round_number: int, user_input: str, narrative: str, state: dict,
+                    volume: int | None = None, chapter: int | None = None,
+                    pov: str | None = None, content_hash: str | None = None) -> int:
+        """写入一轮会话历史，返回自增 id。
+
+        新增参数（volume/chapter/pov/content_hash）均为可选，旧调用方不受影响。
+        """
+        cur = self.conn.execute(
+            """INSERT INTO session_history
+               (round_number,user_input,narrative,story_state_json,volume,chapter,pov,content_hash)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (round_number, user_input, narrative,
+             json.dumps(state, ensure_ascii=False), volume, chapter, pov, content_hash)
         )
         self._commit()
+        return int(cur.lastrowid)
+
+    def mark_session_extracted(self, session_id: int, when: str | None = None) -> None:
+        """标记该轮已完成结构化抽取（extract 幂等的依据）。"""
+        from datetime import datetime as _dt
+        self.conn.execute(
+            "UPDATE session_history SET extracted_at=? WHERE id=?",
+            (when or _dt.now().isoformat(timespec="seconds"), session_id),
+        )
+        self._commit()
+
+    def get_unextracted_sessions(self) -> list[dict]:
+        """所有尚未完成结构化抽取的轮次（extracted_at IS NULL）。"""
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(session_history)")}
+        if "extracted_at" not in cols:
+            return self.get_session_rounds(limit=0)
+        rows = self.conn.execute(
+            "SELECT * FROM session_history WHERE extracted_at IS NULL ORDER BY id"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_session_by_hash(self, content_hash: str) -> Optional[dict]:
+        """按内容哈希查询已入库的轮次（用于 ingest 幂等判定）。"""
+        if not content_hash:
+            return None
+        row = self.conn.execute(
+            "SELECT * FROM session_history WHERE content_hash=? ORDER BY id LIMIT 1",
+            (content_hash,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_max_round(self) -> int:
+        """已入库的最大轮次号（空库为 0）。"""
+        row = self.conn.execute(
+            "SELECT MAX(round_number) AS m FROM session_history"
+        ).fetchone()
+        return int(row["m"]) if row and row["m"] is not None else 0
 
     def get_round_count(self) -> int:
         row = self.conn.execute("SELECT COUNT(*) as cnt FROM session_history").fetchone()

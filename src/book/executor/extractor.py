@@ -5,10 +5,12 @@
 """
 
 from __future__ import annotations
+
+import sys
 import json
 from typing import Optional
 
-from ..writer.generator import LLMClient
+from ..writer.generator import LLMClient, LLM_FAILURE_MARKER
 
 
 EXTRACT_PROMPT = """你是一个精确的信息抽取系统。请从以下小说叙事正文中提取结构化信息，以 JSON 格式返回。
@@ -126,6 +128,9 @@ class Extractor:
 
     def __init__(self, llm: Optional[LLMClient] = None):
         self.llm = llm or LLMClient()
+        # 最近一次抽取失败的原因（None 表示没失败）。
+        # _empty_result() 与"模型确实没抽到东西"无法区分，调用方需要靠这个字段判断。
+        self.last_error: Optional[str] = None
 
     def extract(self, narrative: str) -> dict:
         """
@@ -135,16 +140,24 @@ class Extractor:
             结构化的提取结果字典
         """
         prompt = EXTRACT_PROMPT.replace("{content}", narrative)
+        self.last_error = None
 
         try:
             response = self.llm.complete(
                 prompt, temperature=0.2, max_tokens=2048,
                 response_format={"type": "json_object"},
             )
+            # 降级响应（网络失败 / 无 Key）不是"零变更"，必须让调用方知道抽取没成功
+            if response.lstrip().startswith(LLM_FAILURE_MARKER):
+                raise RuntimeError("LLM 未返回可用内容（调用失败或未配置 API Key）")
             # 尝试从响应中提取 JSON
-            return self._parse_json(response)
+            result = self._parse_json(response)
+            if not result:
+                self.last_error = "LLM 响应无法解析为 JSON"
+            return result
         except Exception as e:
-            print(f"[Extractor] 提取失败: {e}")
+            self.last_error = f"{type(e).__name__}: {e}"
+            print(f"[Extractor] 提取失败: {e}", file=sys.stderr)
             return self._empty_result()
 
     @staticmethod
@@ -169,7 +182,12 @@ class Extractor:
                     return json.loads(text[start:end + 1])
                 except json.JSONDecodeError:
                     pass
-            print(f"[Extractor] JSON 解析失败，原始响应: {text[:200]}...")
+            # 只报长度与首行摘要，避免把整段 prompt 倒进诊断通道
+            head = text.splitlines()[0][:60] if text else ""
+            print(
+                f"[Extractor] JSON 解析失败（响应 {len(text)} 字符）: {head}",
+                file=sys.stderr,
+            )
             return Extractor._empty_result()
 
     @staticmethod

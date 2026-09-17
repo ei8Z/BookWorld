@@ -1,12 +1,20 @@
 """Writer Generator——调用 LLM 生成叙事正文。"""
 
 from __future__ import annotations
+
+import sys
 import httpx
 import json
 from typing import Optional, Generator
 
 from ..config import config
 from .prompt import build_user_prompt
+
+
+# 降级响应标记：调用方据此判断"这次根本没拿到模型输出"，而不是把降级文本当成结果。
+# 前缀 "[未配置 API Key" 是既有约定（main.py / web_server.py / 既有测试都按它判断），
+# 但文案已放宽为"或调用失败"，覆盖"配了 Key 但网络/配额出错"的情况。
+LLM_FAILURE_MARKER = "[未配置 API Key，或调用失败，无法生成内容]"
 
 
 class LLMClient:
@@ -57,7 +65,8 @@ class LLMClient:
             data = response.json()
             return data["choices"][0]["message"]["content"]
         except Exception as e:
-            print(f"[LLM] 调用失败: {type(e).__name__}")
+            # 诊断信息必须走 stderr：stdout 是 --json 契约的单行 JSON 通道
+            print(f"[LLM] 调用失败: {type(e).__name__}", file=sys.stderr)
             return self._fallback_response(user_prompt)
 
     def chat_stream(
@@ -112,7 +121,7 @@ class LLMClient:
                         except (json.JSONDecodeError, KeyError, IndexError):
                             continue
         except Exception as e:
-            print(f"[LLM] 流式调用失败: {type(e).__name__}")
+            print(f"[LLM] 流式调用失败: {type(e).__name__}", file=sys.stderr)
             yield ("content", self._fallback_response(user_prompt))
 
     def complete(self, prompt: str, temperature: float = 0.3, max_tokens: int = 1024,
@@ -128,7 +137,7 @@ class LLMClient:
 
     @staticmethod
     def _fallback_response(user_prompt: str) -> str:
-        return f"[未配置 API Key，无法生成内容]\n输入：{user_prompt[:100]}..."
+        return f"{LLM_FAILURE_MARKER}\n输入：{user_prompt[:100]}..."
 
 
 class Writer:

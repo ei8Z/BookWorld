@@ -12,6 +12,7 @@ dependencies = [
 [project.scripts]
 book = "book.main:main"
 book-web = "book.web_server:run_server"
+bookctl = "book.cli:main"
 
 [build-system]
 requires = ["hatchling"]

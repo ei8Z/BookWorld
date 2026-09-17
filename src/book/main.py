@@ -8,12 +8,15 @@ import json
 from .config import config
 from .db.repository import Repository
 from .memory.manager import MemoryManager
-from .writer.generator import Writer, LLMClient
+from .writer.generator import Writer, LLMClient, LLM_FAILURE_MARKER
 from .writer.prompt import (
     build_writer_system_prompt,
-    build_writer_context,
     build_user_prompt,
 )
+from .writer.context_builder import build_context
+
+# Writer 上下文的正文字符预算（P1：检索式注入取代全量注入）
+CONTEXT_BUDGET_CHARS = 6000
 from .executor.extractor import Extractor
 from .executor.card_manager import CardManager
 from .executor.formatter import OutputFormatter
@@ -22,10 +25,11 @@ from .executor.formatter import OutputFormatter
 class BookEngine:
     """叙事引擎主类——管理完整的一轮生成流水线。"""
 
-    def __init__(self):
+    def __init__(self, db_path=None, *, migrate: bool = True):
+        """db_path 为 None 时用 config.db_path（多书隔离时由调用方传入）。"""
         # 初始化数据库
-        self.repo = Repository(config.db_path)
-        self.repo.init_db()
+        self.repo = Repository(db_path or config.db_path)
+        self.repo.init_db(migrate=migrate)
 
         # LLM 客户端（Writer 和 Extractor 共享，但用不同 temperature）
         self.llm = LLMClient()
@@ -49,62 +53,25 @@ class BookEngine:
         self.writer_system_prompt = build_writer_system_prompt(settings)
 
     def _prepare_context(self, user_input: str) -> tuple:
-        """准备 Writer 上下文，返回 (round_num, full_user_prompt)。"""
+        """准备 Writer 上下文，返回 (round_num, full_user_prompt)。
+
+        P1 起改为提及驱动：只注入 POV 主角、被提及/在场实体、近期剧情、
+        摘要情报、未收伏笔与检索片段，并受字符预算约束——不再无条件拼接
+        全量 NPC/道具/区域/关系卡。
+        """
         round_num = self.repo.get_round_count() + 1
         story_state = self.repo.get_story_state()
-        player = self.repo.get_player()
-        memory_context = self.memory.get_context_for_writer()
-        recent_history = self.repo.get_session_rounds(limit=3)
 
-        all_npcs = self.repo.get_all_npcs()
-        present_npcs = [n for n in all_npcs if n.is_present]
-        npc_context = ""
-        if present_npcs:
-            npc_lines = []
-            for n in present_npcs:
-                detail = f"{n.name}（{n.occupation or '未知身份'}）：{n.appearance[:80]}"
-                detail += f" | 好感度 Lv.{n.affection_level}"
-                detail += f" | 状态: {n.status}"
-                if n.inner_thought:
-                    detail += f" | 内心: {n.inner_thought[:60]}"
-                npc_lines.append(f"- {detail}")
-            npc_context = "\n".join(npc_lines)
-
-        # 道具
-        items = self.repo.get_all_items()
-        items_context = ""
-        if items:
-            item_lines = []
-            for it in items:
-                item_lines.append(f"- [{it.category}] {it.name} | {it.quality.value} | {it.status}")
-            items_context = "\n".join(item_lines)
-
-        # 区域
-        regions = self.repo.get_all_regions()
-        regions_context = ""
-        if regions:
-            region_lines = []
-            for r in regions:
-                region_lines.append(
-                    f"- {r.name} | 危险等级: {r.danger.value} | 治安: {r.security.value} | {r.landmarks}"
-                )
-            regions_context = "\n".join(region_lines)
-
-        # 关系
-        relationships = self.repo.get_all_relationships()
-        relationships_context = ""
-        if relationships:
-            rel_lines = []
-            for r in relationships:
-                rel_lines.append(f"- {r.character_a} → {r.character_b}：{r.relation_type}，{r.description}")
-            relationships_context = "\n".join(rel_lines)
-
-        writer_context = build_writer_context(
-            story_state, player, memory_context, recent_history, npc_context,
-            items_context=items_context,
-            regions_context=regions_context,
-            relationships_context=relationships_context,
+        pov = story_state.current_pov or self.repo.get_player().name
+        pack = build_context(
+            self.repo,
+            pov=pov,
+            scene=story_state.current_scene or "",
+            chapter=story_state.chapter,
+            budget_chars=CONTEXT_BUDGET_CHARS,
+            extra_text=user_input,
         )
+        writer_context = pack.render()
         user_msg = build_user_prompt(user_input)
         full_user = f"{writer_context}\n\n{user_msg}" if writer_context else user_msg
 
@@ -146,7 +113,7 @@ class BookEngine:
             max_tokens=4096,
         )
 
-        if narrative.startswith("[未配置 API Key"):
+        if narrative.lstrip().startswith(LLM_FAILURE_MARKER):
             return narrative
 
         return self._finish_extraction(round_num, user_input, narrative)
@@ -171,7 +138,7 @@ class BookEngine:
                 full_text += chunk
                 yield f"data: {json.dumps({'type': 'chunk', 'content': chunk}, ensure_ascii=False)}\n\n"
 
-        if full_text.startswith("[未配置 API Key"):
+        if full_text.lstrip().startswith(LLM_FAILURE_MARKER):
             yield f"data: {json.dumps({'type': 'done', 'output': full_text}, ensure_ascii=False)}\n\n"
             return
 

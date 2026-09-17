@@ -165,6 +165,8 @@ class StoryState(BaseModel):
     current_time: str = "上午 08:00"  # 时段 HH:MM
     current_scene: str = ""  # 具体地点
     chapter: int = 1
+    current_volume: Optional[int] = None  # P1：卷号（对应 volumes.idx）
+    current_pov: Optional[str] = None     # P1：当前视角角色
 
 
 # ─── 建议行动 ─────────────────────────────────────────────────────────────

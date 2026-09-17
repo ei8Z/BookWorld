@@ -8,3 +8,24 @@ wheels/
 
 # Virtual environments
 .venv
+.venv/
+
+# 数据库文件（只保留本地，不入库）
+# 覆盖 data/*.db 与 data/books/<slug>.db 这类嵌套布局
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*/*.db
+data/*/*.db-wal
+data/*/*.db-shm
+data/books.json
+data/*.lock
+**/data/*.db
+**/data/*.db-wal
+**/data/*.db-shm
+
+# 运行时输出
+output/
+
+# macOS
+.DS_Store
